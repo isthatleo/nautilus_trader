@@ -122,17 +122,24 @@ impl BetfairHttpError {
         }
     }
 
-    /// Returns whether this error leaves order placement in an ambiguous state.
+    /// Returns whether this error leaves an order command in an ambiguous state.
     ///
     /// When true, the request may have been processed by Betfair despite the
-    /// error. Callers must NOT emit `OrderRejected` for ambiguous errors
-    /// because the order may be live on the exchange. The OCM stream will
-    /// reconcile the order via its `customerOrderRef`.
+    /// error. Callers must not emit a terminal rejection for ambiguous errors
+    /// because the venue may have applied the command. OCM or reconciliation
+    /// resolves the outcome.
     #[must_use]
-    pub fn is_order_placement_ambiguous(&self) -> bool {
+    pub fn is_order_command_ambiguous(&self) -> bool {
+        if self.is_rate_limit_error() || self.is_retryable() {
+            return true;
+        }
+
         match self {
-            Self::NetworkError(_) | Self::Timeout(_) => true,
-            Self::UnexpectedStatus { status, .. } => *status >= 500,
+            Self::JsonError(_) | Self::NetworkError(_) | Self::Timeout(_) | Self::Canceled(_) => {
+                true
+            }
+            Self::UnexpectedStatus { status, .. } => !(400..500).contains(status),
+            Self::BetfairError { message, .. } => message.contains("TIMEOUT_ERROR"),
             _ => false,
         }
     }
@@ -226,14 +233,17 @@ mod tests {
     #[case(BetfairHttpError::Timeout("read".to_string()), true)]
     #[case(BetfairHttpError::UnexpectedStatus { status: 502, body: "error code: 502".to_string() }, true)]
     #[case(BetfairHttpError::UnexpectedStatus { status: 500, body: String::new() }, true)]
-    #[case(BetfairHttpError::UnexpectedStatus { status: 429, body: String::new() }, false)]
+    #[case(BetfairHttpError::UnexpectedStatus { status: 429, body: String::new() }, true)]
+    #[case(BetfairHttpError::UnexpectedStatus { status: 200, body: "truncated".to_string() }, true)]
     #[case(BetfairHttpError::UnexpectedStatus { status: 403, body: String::new() }, false)]
+    #[case(BetfairHttpError::BetfairError { code: -32000, message: "TOO_MANY_REQUESTS".to_string() }, true)]
+    #[case(BetfairHttpError::BetfairError { code: -32000, message: "TIMEOUT_ERROR".to_string() }, true)]
     #[case(BetfairHttpError::BetfairError { code: -32600, message: "Invalid".to_string() }, false)]
-    #[case(BetfairHttpError::JsonError("bad".to_string()), false)]
+    #[case(BetfairHttpError::JsonError("bad".to_string()), true)]
     #[case(BetfairHttpError::MissingCredentials, false)]
-    #[case(BetfairHttpError::Canceled("shutdown".to_string()), false)]
-    fn test_is_order_placement_ambiguous(#[case] error: BetfairHttpError, #[case] expected: bool) {
-        assert_eq!(error.is_order_placement_ambiguous(), expected);
+    #[case(BetfairHttpError::Canceled("shutdown".to_string()), true)]
+    fn test_is_order_command_ambiguous(#[case] error: BetfairHttpError, #[case] expected: bool) {
+        assert_eq!(error.is_order_command_ambiguous(), expected);
     }
 
     #[rstest]

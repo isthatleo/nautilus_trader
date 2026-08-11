@@ -18,7 +18,11 @@
 use std::collections::VecDeque;
 
 use ahash::{AHashMap, AHashSet};
-use nautilus_model::identifiers::{ClientOrderId, StrategyId};
+use nautilus_core::UnixNanos;
+use nautilus_model::{
+    identifiers::{ClientOrderId, InstrumentId, StrategyId},
+    types::Quantity,
+};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -53,6 +57,23 @@ pub struct OcmState {
     pub replaced_venue_order_ids: AHashSet<String>,
     /// (client_order_id, old_bet_id) pairs for in-flight replace operations.
     pub pending_update_keys: AHashSet<(ClientOrderId, String)>,
+    pending_replaces: AHashMap<(ClientOrderId, String), PendingReplace>,
+    pending_quantity_updates: AHashMap<(ClientOrderId, String), PendingQuantityUpdate>,
+    confirmed_quantity_updates: AHashMap<(ClientOrderId, String), Quantity>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingReplace {
+    pub instrument_id: InstrumentId,
+    pub quantity: Quantity,
+    pub filled_qty: Quantity,
+    reconcile_after: Option<UnixNanos>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingQuantityUpdate {
+    original: Quantity,
+    requested: Quantity,
 }
 
 impl OcmState {
@@ -125,6 +146,207 @@ impl OcmState {
 
         self.pending_update_keys
             .contains(&(*client_order_id, bet_id.to_string()))
+    }
+
+    pub(crate) fn register_pending_replace(
+        &mut self,
+        client_order_id: ClientOrderId,
+        bet_id: String,
+        instrument_id: InstrumentId,
+        quantity: Quantity,
+        filled_qty: Quantity,
+    ) {
+        self.pending_update_keys
+            .insert((client_order_id, bet_id.clone()));
+        self.pending_replaces.insert(
+            (client_order_id, bet_id),
+            PendingReplace {
+                instrument_id,
+                quantity,
+                filled_qty,
+                reconcile_after: None,
+            },
+        );
+    }
+
+    pub(crate) fn mark_pending_replace_ambiguous(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        old_bet_id: &str,
+        reconcile_after: UnixNanos,
+    ) -> bool {
+        let key = (*client_order_id, old_bet_id.to_string());
+        let Some(pending) = self.pending_replaces.get_mut(&key) else {
+            return false;
+        };
+
+        pending.reconcile_after = Some(reconcile_after);
+        true
+    }
+
+    pub(crate) fn pending_replace_reconcilable(
+        &self,
+        client_order_id: &ClientOrderId,
+        old_bet_id: &str,
+        ts_now: UnixNanos,
+    ) -> bool {
+        let key = (*client_order_id, old_bet_id.to_string());
+        self.pending_replaces
+            .get(&key)
+            .and_then(|pending| pending.reconcile_after)
+            .is_some_and(|reconcile_after| ts_now >= reconcile_after)
+    }
+
+    pub(crate) fn resolve_pending_replace(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        replacement_bet_id: &str,
+        instrument_id: InstrumentId,
+    ) -> Option<PendingReplace> {
+        if self.replaced_venue_order_ids.contains(replacement_bet_id) {
+            return None;
+        }
+
+        let pending: Vec<_> = self
+            .pending_update_keys
+            .iter()
+            .filter(|(cid, bet_id)| {
+                cid == client_order_id
+                    && bet_id != replacement_bet_id
+                    && self
+                        .pending_replaces
+                        .get(&(*cid, bet_id.clone()))
+                        .is_some_and(|pending| pending.instrument_id == instrument_id)
+            })
+            .cloned()
+            .collect();
+        let resolution = pending
+            .iter()
+            .find_map(|update| self.pending_replaces.remove(update));
+
+        for update in &pending {
+            self.pending_update_keys.remove(update);
+            self.pending_replaces.remove(update);
+            self.replaced_venue_order_ids.insert(update.1.clone());
+        }
+
+        resolution
+    }
+
+    pub(crate) fn complete_pending_replace(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        old_bet_id: &str,
+    ) -> Option<PendingReplace> {
+        let key = (*client_order_id, old_bet_id.to_string());
+        self.pending_update_keys.remove(&key);
+        let pending = self.pending_replaces.remove(&key);
+        if pending.is_some() {
+            self.replaced_venue_order_ids.insert(old_bet_id.to_string());
+        }
+        pending
+    }
+
+    pub(crate) fn clear_pending_replace(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        old_bet_id: &str,
+    ) -> Option<PendingReplace> {
+        let key = (*client_order_id, old_bet_id.to_string());
+        self.pending_update_keys.remove(&key);
+        self.pending_replaces.remove(&key)
+    }
+
+    pub(crate) fn pending_replace(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Option<(String, PendingReplace)> {
+        self.pending_replaces
+            .iter()
+            .find(|((cid, _), _)| cid == client_order_id)
+            .map(|((_, bet_id), pending)| (bet_id.clone(), *pending))
+    }
+
+    pub(crate) fn pending_replace_for_bet(
+        &self,
+        client_order_id: &ClientOrderId,
+        old_bet_id: &str,
+    ) -> Option<PendingReplace> {
+        self.pending_replaces
+            .get(&(*client_order_id, old_bet_id.to_string()))
+            .copied()
+    }
+
+    pub(crate) fn register_pending_quantity_update(
+        &mut self,
+        client_order_id: ClientOrderId,
+        bet_id: String,
+        original: Quantity,
+        requested: Quantity,
+    ) {
+        self.pending_quantity_updates.insert(
+            (client_order_id, bet_id),
+            PendingQuantityUpdate {
+                original,
+                requested,
+            },
+        );
+    }
+
+    pub(crate) fn resolve_pending_quantity_update(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        bet_id: &str,
+        active_quantity: Quantity,
+    ) -> bool {
+        let key = (*client_order_id, bet_id.to_string());
+        let Some(update) = self.pending_quantity_updates.get(&key) else {
+            return false;
+        };
+
+        if active_quantity < update.requested || active_quantity >= update.original {
+            return false;
+        }
+
+        self.pending_quantity_updates.remove(&key);
+        self.confirmed_quantity_updates.insert(key, active_quantity);
+        true
+    }
+
+    pub(crate) fn complete_pending_quantity_update(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        bet_id: &str,
+        quantity: Quantity,
+    ) -> bool {
+        let key = (*client_order_id, bet_id.to_string());
+        if self.pending_quantity_updates.remove(&key).is_none() {
+            return false;
+        }
+
+        self.confirmed_quantity_updates.insert(key, quantity);
+        true
+    }
+
+    pub(crate) fn confirmed_quantity_update(
+        &self,
+        client_order_id: &ClientOrderId,
+        bet_id: &str,
+    ) -> Option<Quantity> {
+        self.confirmed_quantity_updates
+            .get(&(*client_order_id, bet_id.to_string()))
+            .copied()
+    }
+
+    pub(crate) fn clear_pending_quantity_update(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        bet_id: &str,
+    ) -> bool {
+        let key = (*client_order_id, bet_id.to_string());
+        let pending = self.pending_quantity_updates.remove(&key).is_some();
+        let confirmed = self.confirmed_quantity_updates.remove(&key).is_some();
+        pending || confirmed
     }
 
     /// Cleans up customer_order_ref mappings for a terminal order,
@@ -217,5 +439,163 @@ mod tests {
 
         assert!(!state.terminal_orders.contains(first_bet_id));
         assert!(replay_after_eviction.is_some());
+    }
+
+    #[rstest]
+    fn resolve_pending_replace_moves_old_bet_to_replaced_state() {
+        let client_order_id = ClientOrderId::from("O-REPLACE");
+        let old_bet_id = "old-bet".to_string();
+        let instrument_id = InstrumentId::from("1.100-1-0.BETFAIR");
+        let mut state = OcmState::default();
+        state.register_pending_replace(
+            client_order_id,
+            old_bet_id.clone(),
+            instrument_id,
+            Quantity::from("10"),
+            Quantity::from("3"),
+        );
+
+        let pending = state
+            .resolve_pending_replace(&client_order_id, "new-bet", instrument_id)
+            .unwrap();
+        assert_eq!(pending.instrument_id, instrument_id);
+        assert_eq!(pending.quantity, Quantity::from("10"));
+        assert_eq!(pending.filled_qty, Quantity::from("3"));
+        assert!(state.pending_update_keys.is_empty());
+        assert_eq!(state.replaced_venue_order_ids.len(), 1);
+        assert!(state.replaced_venue_order_ids.contains(&old_bet_id));
+        assert!(
+            state
+                .resolve_pending_replace(&client_order_id, "newer-bet", instrument_id)
+                .is_none()
+        );
+    }
+
+    #[rstest]
+    fn pending_replace_requires_matching_instrument_and_completed_ambiguity_window() {
+        let client_order_id = ClientOrderId::from("O-REPLACE-COLLISION");
+        let instrument_id = InstrumentId::from("1.100-1-0.BETFAIR");
+        let foreign_instrument_id = InstrumentId::from("1.200-2-0.BETFAIR");
+        let old_bet_id = "old-bet";
+        let mut state = OcmState::default();
+        state.register_pending_replace(
+            client_order_id,
+            old_bet_id.to_string(),
+            instrument_id,
+            Quantity::from("10"),
+            Quantity::from("0"),
+        );
+
+        assert!(!state.pending_replace_reconcilable(
+            &client_order_id,
+            old_bet_id,
+            UnixNanos::from(20),
+        ));
+        assert!(state.mark_pending_replace_ambiguous(
+            &client_order_id,
+            old_bet_id,
+            UnixNanos::from(20),
+        ));
+        assert!(!state.pending_replace_reconcilable(
+            &client_order_id,
+            old_bet_id,
+            UnixNanos::from(19),
+        ));
+        assert!(state.pending_replace_reconcilable(
+            &client_order_id,
+            old_bet_id,
+            UnixNanos::from(20),
+        ));
+        assert!(
+            state
+                .resolve_pending_replace(&client_order_id, "foreign-bet", foreign_instrument_id,)
+                .is_none(),
+        );
+        assert!(
+            state
+                .resolve_pending_replace(&client_order_id, "new-bet", instrument_id)
+                .is_some(),
+        );
+    }
+
+    #[rstest]
+    fn pending_quantity_update_requires_a_definitive_reduction() {
+        let client_order_id = ClientOrderId::from("O-REDUCE");
+        let bet_id = "bet-1";
+        let mut state = OcmState::default();
+        state.register_pending_quantity_update(
+            client_order_id,
+            bet_id.to_string(),
+            Quantity::from("10"),
+            Quantity::from("4"),
+        );
+
+        assert!(!state.resolve_pending_quantity_update(
+            &client_order_id,
+            bet_id,
+            Quantity::from("10"),
+        ));
+        assert!(state.resolve_pending_quantity_update(
+            &client_order_id,
+            bet_id,
+            Quantity::from("6"),
+        ));
+        assert_eq!(
+            state.confirmed_quantity_update(&client_order_id, bet_id),
+            Some(Quantity::from("6")),
+        );
+        assert!(!state.resolve_pending_quantity_update(
+            &client_order_id,
+            bet_id,
+            Quantity::from("4"),
+        ));
+        assert!(state.clear_pending_quantity_update(&client_order_id, bet_id));
+        assert_eq!(
+            state.confirmed_quantity_update(&client_order_id, bet_id),
+            None,
+        );
+    }
+
+    #[rstest]
+    fn historical_replaced_bet_cannot_resolve_later_replace() {
+        let client_order_id = ClientOrderId::from("O-REPLACE-TWICE");
+        let instrument_id = InstrumentId::from("1.100-1-0.BETFAIR");
+        let mut state = OcmState::default();
+        state.register_pending_replace(
+            client_order_id,
+            "bet-1".to_string(),
+            instrument_id,
+            Quantity::from("10"),
+            Quantity::from("0"),
+        );
+        assert!(
+            state
+                .resolve_pending_replace(&client_order_id, "bet-2", instrument_id)
+                .is_some()
+        );
+        state.register_pending_replace(
+            client_order_id,
+            "bet-2".to_string(),
+            instrument_id,
+            Quantity::from("10"),
+            Quantity::from("0"),
+        );
+
+        assert!(
+            state
+                .resolve_pending_replace(&client_order_id, "bet-1", instrument_id)
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .pending_replace(&client_order_id)
+                .map(|(bet_id, _)| bet_id),
+            Some("bet-2".to_string()),
+        );
+        assert!(
+            state
+                .resolve_pending_replace(&client_order_id, "bet-3", instrument_id)
+                .is_some()
+        );
     }
 }

@@ -296,7 +296,7 @@ impl BetfairHttpClient {
         T: DeserializeOwned,
         P: Serialize,
     {
-        self.send_jsonrpc(&self.url_betting, method, params, false)
+        self.send_jsonrpc(&self.url_betting, method, params, false, true)
             .await
     }
 
@@ -315,7 +315,26 @@ impl BetfairHttpClient {
         T: DeserializeOwned,
         P: Serialize,
     {
-        self.send_jsonrpc(&self.url_betting, method, params, true)
+        self.send_jsonrpc(&self.url_betting, method, params, true, true)
+            .await
+    }
+
+    /// Sends one JSON-RPC request to the Betting API with order rate limiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, authentication is missing,
+    /// or the response contains a JSON-RPC error.
+    pub async fn send_betting_order_once<T, P>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<T, BetfairHttpError>
+    where
+        T: DeserializeOwned,
+        P: Serialize,
+    {
+        self.send_jsonrpc(&self.url_betting, method, params, true, false)
             .await
     }
 
@@ -330,7 +349,7 @@ impl BetfairHttpClient {
         T: DeserializeOwned,
         P: Serialize,
     {
-        self.send_jsonrpc(&self.url_accounts, method, params, false)
+        self.send_jsonrpc(&self.url_accounts, method, params, false, true)
             .await
     }
 
@@ -476,6 +495,7 @@ impl BetfairHttpClient {
         method: &str,
         params: P,
         is_order: bool,
+        retry: bool,
     ) -> Result<T, BetfairHttpError>
     where
         T: DeserializeOwned,
@@ -559,6 +579,10 @@ impl BetfairHttpClient {
                 }
             }
         };
+
+        if !retry {
+            return operation().await;
+        }
 
         let should_retry = |error: &BetfairHttpError| -> bool { error.is_retryable() };
 
